@@ -99,31 +99,31 @@ class EpisodeWriter():
             logger_mp.info("==> The class is currently unavailable for new operations. Please wait until ongoing tasks are completed.")
             return False  # Return False if the class is unavailable
 
-        # Reset episode-related data and create necessary directories
+        # Fast, synchronous bookkeeping only -- the actual directory/file creation (I/O that
+        # can stall, see below) is deferred to the worker thread via a sentinel queue item,
+        # so this call returns immediately and doesn't delay the control loop's next XR
+        # tracking read. Confirmed 2026-11-13: pressing "s" caused a visible arm glitch
+        # (frozen control loop -> operator's hand kept moving -> next tracking read showed a
+        # discontinuous jump, high-gain position control snapped to it). The dominant cost was
+        # `RerunLogger(...)` here re-spawning a Rerun viewer connection on every single episode
+        # start (same display-requiring stall as the known aiohttp/rerun jerk, see
+        # docs/teleop-setup-and-run.md's --headless note) for a logger (`self.online_logger`)
+        # that was never actually used anywhere else in this file -- removed outright, not
+        # just deferred, since it did nothing but burn time and jerk the robot.
         self.item_id = -1
         self.episode_id = self.episode_id + 1
-        
+
         self.episode_dir = os.path.join(self.task_dir, f"episode_{str(self.episode_id).zfill(4)}")
         self.color_dir = os.path.join(self.episode_dir, 'colors')
         self.depth_dir = os.path.join(self.episode_dir, 'depths')
         self.audio_dir = os.path.join(self.episode_dir, 'audios')
         self.json_path = os.path.join(self.episode_dir, 'data.json')
-        os.makedirs(self.episode_dir, exist_ok=True)
-        os.makedirs(self.color_dir, exist_ok=True)
-        os.makedirs(self.depth_dir, exist_ok=True)
-        os.makedirs(self.audio_dir, exist_ok=True)
-        with open(self.json_path, "w", encoding="utf-8") as f:
-            f.write('{\n')
-            f.write('"info": ' + json.dumps(self.info, ensure_ascii=False, indent=4) + ',\n')
-            f.write('"text": ' + json.dumps(self.text, ensure_ascii=False, indent=4) + ',\n')
-            f.write('"data": [\n')
         self.first_item = True   # Flag to handle commas in JSON array
 
-        if self.rerun_log:
-            self.online_logger = RerunLogger(prefix="online/", IdxRangeBoundary = 60, memory_limit="300MB")
+        self.item_data_queue.put({"__create_episode_dirs__": True})
 
         self.is_available = False  # After the episode is created, the class is marked as unavailable until the episode is successfully saved
-        logger_mp.info(f"==> New episode created: {self.episode_dir}")
+        logger_mp.info(f"==> New episode queued: {self.episode_dir}")
         return True  # Return True if the episode is successfully created
         
     def add_item(self, colors, depths=None, states=None, actions=None, tactiles=None, audios=None, sim_state=None):
@@ -132,6 +132,7 @@ class EpisodeWriter():
         # Create the item data dictionary
         item_data = {
             'idx': self.item_id,
+            'timestamp': time.time(),
             'colors': colors,
             'depths': depths,
             'states': states,
@@ -149,9 +150,12 @@ class EpisodeWriter():
             try:
                 item_data = self.item_data_queue.get(timeout=1)
                 try:
-                    self._process_item_data(item_data)
+                    if item_data.get("__create_episode_dirs__"):
+                        self._create_episode_dirs()
+                    else:
+                        self._process_item_data(item_data)
                 except Exception as e:
-                    logger_mp.info(f"Error processing item_data (idx={item_data['idx']}): {e}")
+                    logger_mp.info(f"Error processing item_data (idx={item_data.get('idx')}): {e}")
                 self.item_data_queue.task_done()
             except Empty:
                 pass
@@ -159,6 +163,18 @@ class EpisodeWriter():
             # Check if save_episode was triggered
             if self.need_save and self.item_data_queue.empty():
                 self._save_episode()
+
+    def _create_episode_dirs(self):
+        os.makedirs(self.episode_dir, exist_ok=True)
+        os.makedirs(self.color_dir, exist_ok=True)
+        os.makedirs(self.depth_dir, exist_ok=True)
+        os.makedirs(self.audio_dir, exist_ok=True)
+        with open(self.json_path, "w", encoding="utf-8") as f:
+            f.write('{\n')
+            f.write('"info": ' + json.dumps(self.info, ensure_ascii=False, indent=4) + ',\n')
+            f.write('"text": ' + json.dumps(self.text, ensure_ascii=False, indent=4) + ',\n')
+            f.write('"data": [\n')
+        logger_mp.info(f"==> New episode created: {self.episode_dir}")
 
     def _process_item_data(self, item_data):
         idx = item_data['idx']
