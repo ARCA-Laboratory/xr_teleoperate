@@ -28,26 +28,33 @@ class Inspire_Controller_DFX:
             self.hand_retargeting = HandRetargeting(HandType.INSPIRE_HAND_Unit_Test)
 
 
-        # initialize handcmd publisher. The STATE SUBSCRIBER is deliberately NOT created
-        # here -- see control_process for why.
+        # initialize handcmd publisher and handstate subscriber
         self.HandCmb_publisher = ChannelPublisher(kTopicInspireDFXCommand, MotorCmds_)
         self.HandCmb_publisher.Init()
 
+        self.HandState_subscriber = ChannelSubscriber(kTopicInspireDFXState, MotorStates_)
+        self.HandState_subscriber.Init()
+
         # Shared Arrays for hand states
-        self.left_hand_state_array  = Array('d', Inspire_Num_Motors, lock=True)
+        self.left_hand_state_array  = Array('d', Inspire_Num_Motors, lock=True)  
         self.right_hand_state_array = Array('d', Inspire_Num_Motors, lock=True)
+
+        # initialize subscribe thread
+        self.subscribe_state_thread = threading.Thread(target=self._subscribe_hand_state)
+        self.subscribe_state_thread.daemon = True
+        self.subscribe_state_thread.start()
+
+        while True:
+            if any(self.right_hand_state_array): # any(self.left_hand_state_array) and 
+                break
+            time.sleep(0.01)
+            logger_mp.warning("[Inspire_Controller_DFX] Waiting to subscribe dds...")
+        logger_mp.info("[Inspire_Controller_DFX] Subscribe dds ok.")
 
         hand_control_process = Process(target=self.control_process, args=(left_hand_array, right_hand_array,  self.left_hand_state_array, self.right_hand_state_array,
                                                                           dual_hand_data_lock, dual_hand_state_array, dual_hand_action_array, xr_motion_data_ready_in))
         hand_control_process.daemon = True
         hand_control_process.start()
-
-        while True:
-            if any(self.right_hand_state_array): # any(self.left_hand_state_array) and
-                break
-            time.sleep(0.01)
-            logger_mp.warning("[Inspire_Controller_DFX] Waiting to subscribe dds...")
-        logger_mp.info("[Inspire_Controller_DFX] Subscribe dds ok.")
 
         logger_mp.info("Initialize Inspire_Controller_DFX OK!")
 
@@ -76,20 +83,6 @@ class Inspire_Controller_DFX:
     def control_process(self, left_hand_array, right_hand_array, left_hand_state_array, right_hand_state_array,
                               dual_hand_data_lock = None, dual_hand_state_array = None, dual_hand_action_array = None, xr_motion_data_ready_in = None):
         self.running = True
-
-        # DDS hand-state subscriber + its reader thread are created HERE, inside this
-        # forked child process -- not in __init__ (the parent). cyclonedds/unitree_sdk2py's
-        # DDS participant isn't fork-safe; initializing it pre-fork then forking a new
-        # process left the PARENT's subscriber thread frozen on a stale/garbage reading.
-        # Confirmed 2026-11-12: all 50 stack_block episodes had observation.state's hand
-        # dims stuck at a constant, out-of-range value for 30-100% of every episode, while
-        # the commanded action (a separate pipeline -- XR hand-retargeting output, never
-        # touches this subscriber) stayed clean the whole time.
-        self.HandState_subscriber = ChannelSubscriber(kTopicInspireDFXState, MotorStates_)
-        self.HandState_subscriber.Init()
-        self.subscribe_state_thread = threading.Thread(target=self._subscribe_hand_state)
-        self.subscribe_state_thread.daemon = True
-        self.subscribe_state_thread.start()
 
         left_q_target  = np.full(Inspire_Num_Motors, 1.0)
         right_q_target = np.full(Inspire_Num_Motors, 1.0)
